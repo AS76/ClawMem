@@ -78,6 +78,8 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 4.  Chain tracing       -> find_causal_links(docid, direction="both", depth=5)
 5.  Entity facts        -> kg_query(entity)  (SPO triples; different from intent_search's reasoning chains)
 6.  Temporal context    -> timeline(docid, before=5, after=5)
+7.  Ranking diagnosis   -> memory_rank(query)  ("why did X outrank Y": per-factor
+    composite breakdown + raw-vs-composite rank shifts; diagnostic, not retrieval)
 ```
 
 ### All MCP tools
@@ -211,6 +213,8 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 - **Recency intent** ("latest"/"recent"/"last session") switches all to **0.10·search + 0.70·recency + 0.20·confidence**.
 
 **Content-type half-lives:** deductive / preference / hub / antipattern = ∞ (never decay) · decision 180d (very slow ranking decay — §36.11) · project 120d · research 90d · problem / milestone / note 60d · conversation / progress 45d · handoff 30d. Half-lives extend up to 3× for frequently-accessed memories. Attention decay: non-durable types (handoff, progress, conversation, note, project) lose 5% confidence/week without access; decision / deductive / preference / hub / research / antipattern are exempt.
+
+**Inspect a live ranking (v0.36.0):** `memory_rank(query)` returns each result's captured per-factor breakdown (weights, multipliers, signed pinΔ — negative means the 1.0 pin cap clamped a high scorer down — co-activation) plus raw-vs-composite rank shifts, with demoted raw winners flagged.
 
 → full derivation: [`docs/concepts/composite-scoring.md`](docs/concepts/composite-scoring.md).
 

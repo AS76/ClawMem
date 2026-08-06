@@ -126,6 +126,7 @@ Use `memory_retrieve(query)` — it auto-classifies the query and routes to the 
 | Complex multi-topic | `query_plan` | Decomposes into typed parallel retrieval |
 | General recall | `query` | Full hybrid: BM25 + vector + expansion + reranking |
 | Keyword spot check | `search` | BM25 only, zero GPU cost |
+| Why did X outrank Y | `memory_rank` | Per-factor composite breakdown + raw-vs-composite rank shifts — a diagnostic, not retrieval (v0.36.0) |
 | Conceptual / fuzzy | `vsearch` | Vector only, semantic similarity |
 
 `diary_write` and `diary_read` are for non-hooked environments only (Hermes, Gemini, plain MCP clients). In Claude Code, hooks capture observations and handoffs automatically.

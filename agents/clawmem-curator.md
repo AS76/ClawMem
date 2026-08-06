@@ -24,7 +24,8 @@ Gather baseline data. All subsequent phases use these values.
 1. Call `mcp__clawmem__status()` — document counts, embedding coverage
 2. Call `mcp__clawmem__index_stats()` — content type distribution, stale count, avg access
 3. Call `mcp__clawmem__lifecycle_status()` — active/archived/forgotten/pinned/snoozed counts
-4. Bash (60s timeout): `clawmem doctor 2>&1`
+4. Call `mcp__clawmem__memory_stats()` (v0.36.0) — per-collection origin×active cross-tabs, deactivation reasons, accrual (7d/30d), and access/confidence/quality/effective-age distributions over active rows
+5. Bash (60s timeout): `clawmem doctor 2>&1`
 
 Record all values. Then check:
 
@@ -373,6 +374,7 @@ General rules:
 ### Infrastructure
 - `status()` — quick health
 - `index_stats()` — detailed stats
+- `memory_stats(collection?)` — lifecycle + ranking-metadata aggregates per collection (origin×active cross-tabs, deactivation reasons, accrual, distributions)
 - `build_graphs(graph_types=["all"], semantic_threshold=0.7)` — rebuild graphs
 - `find_similar(file)` — related docs
 - `find_causal_links(docid)` — causal chain
