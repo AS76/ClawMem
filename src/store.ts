@@ -53,6 +53,7 @@ import {
   generateMemoryLinks,
   evolveMemories,
   postIndexEnrich,
+  type EnrichOutcome,
 } from "./amem.ts";
 import { parseLegacyEdgeWitness } from "./causal-reader.ts";
 import {
@@ -1748,7 +1749,7 @@ export type Store = {
   storeMemoryNote: (docId: number, note: any) => boolean;
   generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => Promise<number>;
   evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => Promise<boolean>;
-  postIndexEnrich: (llm: any, docId: number, isNew: boolean) => Promise<void>;
+  postIndexEnrich: (llm: any, docId: number, isNew: boolean) => Promise<EnrichOutcome>;
   findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalEdgesResult;
   getEvolutionTimeline: (docId: number, limit?: number) => EvolutionEntry[];
 

@@ -1421,7 +1421,7 @@ This is the recommended entry point for ALL memory queries.`,
     async ({ vault }) => {
       const store = getStore(vault);
       const collections = listCollections();
-      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
+      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0, enrichAttempted: 0, enrichStored: 0 };
 
       for (const col of collections) {
         const stats = await indexCollection(store, col.name, col.path, col.pattern);
@@ -1430,9 +1430,18 @@ This is the recommended entry point for ALL memory queries.`,
         totalStats.unchanged += stats.unchanged;
         totalStats.removed += stats.removed;
         totalStats.dated += stats.dated;
+        totalStats.enrichAttempted += stats.enrichAttempted;
+        totalStats.enrichStored += stats.enrichStored;
       }
 
-      const summary = `Reindex complete: +${totalStats.added} added, ~${totalStats.updated} updated, =${totalStats.unchanged} unchanged, -${totalStats.removed} removed`;
+      // Issue #24: surface enrichment productivity in the summary — a run where
+      // every enrichment produced nothing must not read as an unqualified success.
+      const enrichNote = totalStats.enrichAttempted === 0
+        ? ""
+        : totalStats.enrichStored === totalStats.enrichAttempted
+          ? `, ✎${totalStats.enrichStored}/${totalStats.enrichAttempted} notes`
+          : `, ✎${totalStats.enrichStored}/${totalStats.enrichAttempted} notes (${totalStats.enrichAttempted - totalStats.enrichStored} produced nothing — LLM endpoint problem? run 'clawmem doctor')`;
+      const summary = `Reindex complete: +${totalStats.added} added, ~${totalStats.updated} updated, =${totalStats.unchanged} unchanged, -${totalStats.removed} removed${enrichNote}`;
       return {
         content: [{ type: "text" as const, text: summary }],
         structuredContent: { ...totalStats } as Record<string, unknown>,
@@ -2849,10 +2858,17 @@ This is the recommended entry point for ALL memory queries.`,
 
       try {
         const stats = await indexCollection(s, collName, root, pattern || "**/*.md");
+        // Issue #24 (codex turn-2 finding 3): the user-facing summary must not
+        // read as unqualified success when every note write produced nothing.
+        const noteLine = stats.enrichAttempted === 0
+          ? ""
+          : stats.enrichStored === stats.enrichAttempted
+            ? `\n  Notes: ${stats.enrichStored}/${stats.enrichAttempted} stored`
+            : `\n  Notes: ${stats.enrichStored}/${stats.enrichAttempted} stored (${stats.enrichAttempted - stats.enrichStored} produced nothing — LLM endpoint problem? run 'clawmem doctor')`;
         return {
           content: [{
             type: "text",
-            text: `Synced to vault "${vault}":\n  Collection: ${collName}\n  Root: ${root}\n  Added: ${stats.added}\n  Updated: ${stats.updated}\n  Deleted: ${stats.removed}`,
+            text: `Synced to vault "${vault}":\n  Collection: ${collName}\n  Root: ${root}\n  Added: ${stats.added}\n  Updated: ${stats.updated}\n  Deleted: ${stats.removed}${noteLine}`,
           }],
           structuredContent: { vault, collection: collName, ...stats },
         };

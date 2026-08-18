@@ -1071,16 +1071,33 @@ If no evolution is needed:
  * @param docId - Document numeric ID
  * @param isNew - True if this is a new document, false if update
  */
+/**
+ * Outcome of one post-index enrichment attempt. The metric is the NOTE WRITE
+ * — the one phase every enrichment attempt runs — and callers label it as
+ * such ("✎stored/attempted notes"), never as whole-pipeline success (codex
+ * turn-2 finding 1). "stored" means the note was durably written, and holds
+ * even when a LATER phase (entities/links/evolution) fails — those failures
+ * keep their own log lines. "empty" means the note phase produced nothing
+ * usable (outage, squatted endpoint, refused empty note) — the state issue
+ * #24 showed can persist invisibly, so callers aggregate these into the
+ * update summary instead of letting per-doc log lines be the only trace.
+ * "error" is reserved for a failure BEFORE a note could be stored.
+ */
+export type EnrichOutcome = "stored" | "empty" | "disabled" | "error";
+
 export async function postIndexEnrich(
   store: Store,
   llm: LlamaCpp,
   docId: number,
   isNew: boolean
-): Promise<void> {
+): Promise<EnrichOutcome> {
+  // Hoisted so the outer catch can report a durably-stored note as "stored"
+  // even when a later phase throws — the metric describes the note write.
+  let noteStored = false;
   try {
     // Check feature flag
     if (Bun.env.CLAWMEM_ENABLE_AMEM === 'false') {
-      return;
+      return "disabled";
     }
 
     console.log(`[amem] Starting enrichment for docId ${docId} (isNew=${isNew})`);
@@ -1090,9 +1107,12 @@ export async function postIndexEnrich(
     // §55.6 D8.2: report what actually happened. An empty note is refused, and saying
     // "Completed note refresh" after a refused write is how a silent inference outage used to
     // read as success in the logs.
-    const noteStored = storeMemoryNote(store, docId, note);
+    noteStored = storeMemoryNote(store, docId, note);
     if (!noteStored) {
-      console.log(`[amem] No note stored for docId ${docId} (enrichment produced nothing — existing note, if any, left intact)`);
+      // "note phase", not "enrichment": for new documents the entity and link
+      // phases still run below and can succeed — the note-write metric must
+      // not be narrated as whole-pipeline failure (codex turn-3 finding 1).
+      console.log(`[amem] No note stored for docId ${docId} (note phase produced nothing — existing note, if any, left intact)`);
     }
 
     // For updated documents, stop here to avoid churn
@@ -1102,7 +1122,7 @@ export async function postIndexEnrich(
           ? `[amem] Completed note refresh for docId ${docId}`
           : `[amem] Note refresh for docId ${docId} made no change`,
       );
-      return;
+      return noteStored ? "stored" : "empty";
     }
 
     // Step 2: Entity extraction + resolution + co-occurrence (new documents only)
@@ -1135,8 +1155,13 @@ export async function postIndexEnrich(
     }
 
     console.log(`[amem] Completed full enrichment for docId ${docId}`);
+    return noteStored ? "stored" : "empty";
   } catch (err) {
     console.log(`[amem] Error in postIndexEnrich for docId ${docId}:`, err);
+    // A stored note stays "stored": the metric is the note write, and a
+    // later-phase failure must not erase a durable write from the count
+    // (codex turn-2 finding 1). "error" = nothing was stored before the throw.
+    return noteStored ? "stored" : "error";
   }
 }
 

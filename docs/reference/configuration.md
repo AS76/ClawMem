@@ -11,14 +11,14 @@ See also: [../guides/inference-services.md](../guides/inference-services.md) (st
 | Variable | Default (via wrapper) | Effect |
 |---|---|---|
 | `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server URL. Local `llama-server`, cloud API, or in-process `node-llama-cpp` fallback if unset. |
-| `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server for intent, expansion, A-MEM, entity extraction. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. Point at a 7B+ model or cloud API during `reindex --enrich` for better entity extraction. |
+| `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server for intent, expansion, A-MEM, entity extraction. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. Point at a 7B+ model or cloud API during `reindex --enrich` for better entity extraction. Since v0.37.0, persistent HTTP errors (405/501 instantly, other non-2xx after 3 consecutive; 429 never) trip the same 60s cooldown as transport failures, so a squatted port cannot silently disable enrichment — `clawmem doctor` probes the endpoint's response shape. |
 | `CLAWMEM_LLM_API_KEY` | (none) | Bearer token for an authenticated remote LLM endpoint. Independent of the embed/rerank keys — set it when the LLM points at a different authenticated host. |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server. Falls to `node-llama-cpp` if unset + `NO_LOCAL_MODELS=false`. |
 | `CLAWMEM_RERANK_API_KEY` | (none) | Bearer token for an authenticated remote reranker endpoint. Independent of the embed/LLM keys. |
 | `CLAWMEM_LLM_MODEL` | `qwen3` | Model name sent on LLM requests. |
 | `CLAWMEM_LLM_REASONING_EFFORT` | (none) | Top-level `reasoning_effort` for Chat Completions endpoints that support it (e.g. a remote reasoning model). Optional. |
 | `CLAWMEM_LLM_NO_THINK` | enabled | Appends `/no_think` to remote LLM prompts (Qwen3 emits thinking tokens by default). Set `false` for standard OpenAI-compatible models that would treat `/no_think` as literal text. |
-| `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUFs. Set `true` for remote-only setups to fail fast on unreachable endpoints. |
+| `CLAWMEM_NO_LOCAL_MODELS` | `false` | Blocks `node-llama-cpp` from auto-downloading GGUFs. Set `true` for remote-only setups to fail fast on unreachable endpoints. With it set, a tripped or unreachable endpoint returns null instead of falling back — watch the `✎stored/attempted notes` counter in index-run summaries. |
 
 ## Cloud embedding
 

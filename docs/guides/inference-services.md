@@ -22,6 +22,7 @@ Three stacks, picked by hardware, license, and quality needs. This is the decisi
 - **`-ub` must equal `-b`** for embedding/reranking models (non-causal attention) or `llama-server` asserts (`non-causal attention requires n_ubatch >= n_tokens`). The zerank-2 sidecar is transformers-served and exempt; the qwen3-reranker GGUF does not need it. See [llama.cpp#12836](https://github.com/ggml-org/llama.cpp/issues/12836).
 - **Changing embedding dimensions requires a full re-embed:** `clawmem embed --force` (idempotent, safe to interrupt/resume).
 - **Set `CLAWMEM_NO_LOCAL_MODELS=true`** for remote-only / dedicated-server setups to fail fast on an unreachable endpoint instead of silently auto-downloading multi-GB GGUFs and running CPU inference.
+- **A squatted port is not a healthy endpoint.** If an unrelated service occupies a configured port (the default range 8088–8090 is popular), it answers HTTP while serving nothing — through v0.36.0 that disabled enrichment silently and permanently. Since v0.37.0 persistent HTTP errors trip the same 60s cooldown as transport failures (405/501 instantly, other non-2xx after 3 consecutive), and `clawmem doctor` POSTs a real completion to `CLAWMEM_LLM_URL` and validates the response shape — reachability is not correctness.
 
 ## Default stack — QMD native (any GPU or in-process)
 

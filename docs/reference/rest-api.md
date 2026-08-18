@@ -169,7 +169,7 @@ do not break.
 |--------|------|-------------|
 | GET | `/collections` | List all collections |
 | GET | `/profile` | Get user profile |
-| POST | `/reindex` | Trigger re-scan |
+| POST | `/reindex` | Trigger re-scan. Response includes `enrichAttempted`/`enrichStored` note counters (v0.37.0) — a run whose enrichment produced nothing is visible, not an unqualified success |
 | POST | `/graphs/build` | Rebuild temporal + semantic graphs |
 | GET | `/export` | Full vault export as JSON |
 

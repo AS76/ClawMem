@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.36.0**.
+Guide for upgrading between released versions. Current: **v0.37.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,27 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.37.0: reachable-but-wrong inference endpoints degrade instead of silently dying
+
+**No migration** — no schema change, no reindex, no re-embed. One behaviour change to
+know about: an LLM or self-hosted embedding endpoint that persistently answers HTTP
+errors (405/501 immediately; any other non-2xx after 3 consecutive failures) now trips
+the same 60-second cooldown a transport failure does, so the in-process fallback engages
+where it is permitted. Through v0.36.0 that state never tripped, and a port squatted by
+an unrelated service could disable A-MEM enrichment silently and permanently while
+indexing kept reporting success (public issue #24). Cloud embedding (API key set) is
+exempt and never falls back; 429 never counts.
+
+Restart long-lived processes (`clawmem watch`, `clawmem serve`, systemd units) to pick up
+the new behaviour. Two new signals to know: `clawmem doctor` now probes
+`CLAWMEM_LLM_URL` with a real completion and validates the response shape, and every
+index-run summary (`update` / `reindex` / `mine` / watcher / MCP / REST) reports
+`✎stored/attempted notes` with an explicit warning when enrichment produced nothing.
+`IndexStats` and the REST `/reindex` response gain `enrichAttempted`/`enrichStored`
+(additive).
 
 ---
 

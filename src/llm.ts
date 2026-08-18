@@ -411,7 +411,19 @@ function normalizeRemoteLlmReasoningEffort(value?: string): string | null {
   return raw;
 }
 
-function buildRemoteChatCompletionsUrl(remoteLlmUrl: string): string {
+/**
+ * The no-think normalization getDefaultLlamaCpp applies to
+ * CLAWMEM_LLM_NO_THINK — exported for the same identity-fingerprint reason:
+ * "1"/"true"/"yes" (and any other non-negative string) all normalize to the
+ * SAME runtime behavior and must fingerprint identically.
+ */
+export function normalizeRemoteLlmNoThink(value?: string): boolean | undefined {
+  const raw = (value || "").trim().toLowerCase();
+  if (!raw) return undefined;
+  return !["0", "false", "no", "off"].includes(raw);
+}
+
+export function buildRemoteChatCompletionsUrl(remoteLlmUrl: string): string {
   const baseUrl = remoteLlmUrl.replace(/\/+$/, "");
   if (baseUrl.endsWith("/chat/completions")) return baseUrl;
   const endpoint = baseUrl.endsWith("/v1") ? "/chat/completions" : "/v1/chat/completions";
@@ -461,6 +473,24 @@ export class LlamaCpp implements LLM {
   private remoteEmbedFallbackNotifiedUntil = 0;
   private remoteLlmFallbackNotifiedUntil = 0;
   private static readonly REMOTE_COOLDOWN_MS = 60_000; // 60s cooldown on transport failure
+
+  // HTTP-shape failure accounting for the self-hosted remote lanes (issue #24)
+  // — see noteRemoteHttpError.
+  private remoteLlmHttpErrorStreak = 0;
+  private remoteEmbedHttpErrorStreak = 0;
+  /** Consecutive non-2xx (non-429) responses that trip the down-cache. */
+  private static readonly REMOTE_HTTP_TRIP_STREAK = 3;
+  /**
+   * Statuses a correctly-routed OpenAI-compatible endpoint cannot return for
+   * these POSTs (method not allowed / not implemented) — the signature of an
+   * unrelated service squatting the port. Instant trip. 404 is deliberately
+   * NOT here (codex turn-1 finding 1): cloud/gateway endpoints return 404 for
+   * an unknown model or deployment while the route itself is correct, so a
+   * mis-set CLAWMEM_LLM_MODEL must not instantly cost the lane — 404 rides
+   * the consecutive-failure streak instead (a genuinely squatted port 404s
+   * every call and still trips within REMOTE_HTTP_TRIP_STREAK calls).
+   */
+  private static readonly REMOTE_HTTP_INSTANT_TRIP = new Set([405, 501]);
 
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
@@ -938,6 +968,119 @@ export class LlamaCpp implements LLM {
     );
   }
 
+  /**
+   * HTTP-level (non-2xx) failure accounting for the self-hosted remote lanes
+   * (issue #24). One HTTP error is a reachable server misbehaving — never a
+   * reason to abandon the GPU lane. But a port squatted by an unrelated
+   * service answers HTTP errors FOREVER, and through v0.36.0 that state never
+   * tripped the down-cache, so the local fallback never engaged and enrichment
+   * failed silently on every call while indexing kept reporting success. Two
+   * triggers flip the lane into the normal 60s cooldown (after which the
+   * existing fallback + notify-once machinery takes over):
+   *   - an endpoint-shape status (REMOTE_HTTP_INSTANT_TRIP) that a correctly
+   *     routed endpoint cannot return — instant, or
+   *   - REMOTE_HTTP_TRIP_STREAK consecutive non-2xx responses (429 is excluded
+   *     by the callers — rate limiting is a healthy endpoint).
+   * The cooldown self-heals: a real server that recovers gets its lane back on
+   * the first attempt after expiry. Known limit: a squatter that answers 200
+   * with a non-JSON body is not counted here (the parse failure surfaces in the
+   * callers' catch as a logged error); non-2xx is the observed squatted-port
+   * signature and the conservative trigger.
+   */
+  private noteRemoteHttpError(kind: "embed" | "llm", status: number, statusText: string): void {
+    // Idempotent under concurrency (codex turn-1 finding 2): several requests
+    // can pass the pre-fetch cooldown check together and each come back with
+    // an HTTP error. The FIRST trip owns the transition — once the lane is
+    // already down, later in-flight responses are swallowed (streak cleared,
+    // no second actionable line, and notifiedUntil is NOT reset again, which
+    // would defeat the notify-once contract downstream).
+    const alreadyDown = kind === "llm" ? this.isRemoteLlmDown() : this.isRemoteEmbedDown();
+    if (alreadyDown) {
+      if (kind === "llm") this.remoteLlmHttpErrorStreak = 0;
+      else this.remoteEmbedHttpErrorStreak = 0;
+      return;
+    }
+    const streak = kind === "llm" ? ++this.remoteLlmHttpErrorStreak : ++this.remoteEmbedHttpErrorStreak;
+    const instant = LlamaCpp.REMOTE_HTTP_INSTANT_TRIP.has(status);
+    if (!instant && streak < LlamaCpp.REMOTE_HTTP_TRIP_STREAK) return;
+    const url = kind === "llm" ? this.remoteLlmUrl : this.remoteEmbedUrl;
+    const envVar = kind === "llm" ? "CLAWMEM_LLM_URL" : "CLAWMEM_EMBED_URL";
+    const tag = kind === "llm" ? "[generate]" : "[embed]";
+    const api = kind === "llm" ? "chat-completions" : "embeddings";
+    const reason = instant
+      ? `HTTP ${status}${statusText ? ` ${statusText}` : ""} — a correctly-routed ${api} endpoint never returns this status; another service is likely listening at that address`
+      : `${streak} consecutive HTTP error(s) (last: ${status}${statusText ? ` ${statusText}` : ""}) — the endpoint is reachable but persistently refusing this API (squatted port, wrong route, or a misconfigured model name)`;
+    console.error(
+      `${tag} Remote endpoint at ${url} answers HTTP but not the ${api} API: ${reason}. ` +
+      `Treating it as down for 60s so the fallback path engages — check ${envVar}.`
+    );
+    if (kind === "llm") {
+      this.remoteLlmHttpErrorStreak = 0;
+      this.remoteLlmDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS;
+      this.remoteLlmFallbackNotifiedUntil = 0;
+    } else {
+      this.remoteEmbedHttpErrorStreak = 0;
+      this.remoteEmbedDownUntil = Date.now() + LlamaCpp.REMOTE_COOLDOWN_MS;
+      this.remoteEmbedFallbackNotifiedUntil = 0;
+    }
+  }
+
+  /**
+   * One-shot shape probe for a remote chat-completions endpoint (doctor
+   * section 12; extracted so the probe itself is directly testable against
+   * real fixture servers — codex turn-1 finding 4). Sends a minimal
+   * completion and classifies the outcome. Honors the same no-think policy
+   * normalization the runtime uses (codex turn-1 finding 3): an endpoint
+   * configured with CLAWMEM_LLM_NO_THINK=false must not be probed with a
+   * Qwen-specific control token it may reject.
+   */
+  static async probeChatCompletionsShape(opts: {
+    url: string;
+    apiKey?: string;
+    model?: string;
+    noThink?: boolean;
+    timeoutMs?: number;
+  }): Promise<
+    | { status: "ok"; model: string }
+    | { status: "http"; httpStatus: number }
+    | { status: "shape"; detail: string }
+    | { status: "transport"; detail: string }
+  > {
+    const endpoint = buildRemoteChatCompletionsUrl(opts.url);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (opts.apiKey) headers["Authorization"] = `Bearer ${opts.apiKey}`;
+    const noThink = opts.noThink ?? true;
+    try {
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: opts.model?.trim() || "qwen3",
+          messages: [{ role: "user", content: noThink ? "Reply with OK /no_think" : "Reply with OK" }],
+          max_tokens: 8,
+          temperature: 0,
+        }),
+        signal: AbortSignal.timeout(opts.timeoutMs ?? 10_000),
+      });
+      if (!resp.ok) return { status: "http", httpStatus: resp.status };
+      const data = await resp.json().catch(() => null) as {
+        choices?: { message?: { content?: unknown } }[];
+        model?: string;
+      } | null;
+      // Deep shape check (codex turn-1 finding 4): {"choices":[]} or a choices
+      // array without a string message.content proves nothing about the API.
+      if (!data || !Array.isArray(data.choices) || data.choices.length === 0) {
+        return { status: "shape", detail: "no choices array (or it is empty)" };
+      }
+      if (typeof data.choices[0]?.message?.content !== "string") {
+        return { status: "shape", detail: "choices[0].message.content is not a string" };
+      }
+      return { status: "ok", model: data.model || "unnamed" };
+    } catch (err) {
+      return { status: "transport", detail: (err as Error).message };
+    }
+  }
+
   // ---------- Remote embedding (GPU server or cloud API via /v1/embeddings) ----------
 
   // Default: 6000 chars for EmbeddingGemma-300M (2048-token context).
@@ -1057,8 +1200,14 @@ export class LlamaCpp implements LLM {
         }
         if (!resp.ok) {
           console.error(`Remote embed HTTP ${resp.status}: ${await resp.text()}`);
+          // Cloud lanes (API key set) never fall back by design — an auth/quota
+          // HTTP error must stay a per-call error, not flip the vault onto a
+          // different local model mid-run. The squatted-port trip (issue #24)
+          // applies to the self-hosted lane only.
+          if (!this.isCloudEmbedding()) this.noteRemoteHttpError("embed", resp.status, resp.statusText);
           return null;
         }
+        this.remoteEmbedHttpErrorStreak = 0;
         const data = await resp.json() as {
           data: { embedding: number[] }[];
           model?: string;
@@ -1111,8 +1260,11 @@ export class LlamaCpp implements LLM {
         }
         if (!resp.ok) {
           console.error(`Remote batch embed HTTP ${resp.status}: ${await resp.text()}`);
+          // Same self-hosted-lane trip as embedRemote (issue #24); cloud lanes exempt.
+          if (!this.isCloudEmbedding()) this.noteRemoteHttpError("embed", resp.status, resp.statusText);
           return texts.map(() => null);
         }
+        this.remoteEmbedHttpErrorStreak = 0;
         const data = await resp.json() as {
           data: { embedding: number[]; index: number }[];
           model?: string;
@@ -1243,9 +1395,18 @@ export class LlamaCpp implements LLM {
 
       if (!resp.ok) {
         console.error(`[generate] Remote LLM HTTP ${resp.status}: ${resp.statusText}`);
-        // HTTP errors mean the server IS reachable — don't trigger down-cache
+        // A SINGLE HTTP error means the server IS reachable — a healthy endpoint
+        // having a bad moment must not lose its GPU lane to one 500. But an
+        // endpoint that ONLY answers HTTP errors is indistinguishable from a
+        // squatted port (issue #24: an unrelated service on :8089 disabled
+        // enrichment silently for months), so a streak — or an endpoint-shape
+        // status a real chat-completions route can never return — trips the
+        // down-cache and lets the fallback engage. 429 is a healthy-but-limited
+        // endpoint: never counted.
+        if (resp.status !== 429) this.noteRemoteHttpError("llm", resp.status, resp.statusText);
         return null;
       }
+      this.remoteLlmHttpErrorStreak = 0;
 
       const data = await resp.json() as {
         choices: { message: { content: string } }[];
@@ -1617,11 +1778,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
       remoteLlmApiKey: process.env.CLAWMEM_LLM_API_KEY || undefined,
       remoteLlmModel: process.env.CLAWMEM_LLM_MODEL?.trim() || undefined,
       remoteLlmReasoningEffort: process.env.CLAWMEM_LLM_REASONING_EFFORT || undefined,
-      remoteLlmNoThink: (() => {
-        const raw = (process.env.CLAWMEM_LLM_NO_THINK || "").trim().toLowerCase();
-        if (!raw) return undefined;
-        return !["0", "false", "no", "off"].includes(raw);
-      })(),
+      remoteLlmNoThink: normalizeRemoteLlmNoThink(process.env.CLAWMEM_LLM_NO_THINK),
     });
   }
   return defaultLlamaCpp;

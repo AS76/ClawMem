@@ -34,10 +34,12 @@ import { startVectorDaemon, type VectorDaemonHandle } from "./vector-daemon.ts";
 import {
   getDefaultLlamaCpp,
   setDefaultLlamaCpp,
+  buildRemoteChatCompletionsUrl,
   disposeDefaultLlamaCpp,
   formatDocForEmbedding,
   formatQueryForEmbedding,
   LlamaCpp,
+  normalizeRemoteLlmNoThink,
   type Queryable,
 } from "./llm.ts";
 import {
@@ -145,6 +147,25 @@ const c = {
 function die(msg: string): never {
   console.error(`${c.red}Error:${c.reset} ${msg}`);
   process.exit(1);
+}
+
+/**
+ * Enrichment segment for index-run summaries (issue #24): the per-doc `[amem]`
+ * lines are easy to read past, so the run summary states how many enrichment
+ * attempts stored a note. The label is "notes" deliberately — the metric is
+ * the NOTE WRITE, not whole-pipeline success (codex turn-2 finding 1): a
+ * stored note whose later link phase failed still counts, and an empty note
+ * whose entity phase succeeded still shows as producing nothing. A persistent
+ * gap is the dead-or-squatted inference signature. Empty string when nothing
+ * ran (no enrichable changes, or CLAWMEM_ENABLE_AMEM=false).
+ */
+function enrichSummaryNote(stats: { enrichAttempted: number; enrichStored: number }): string {
+  if (stats.enrichAttempted === 0) return "";
+  if (stats.enrichStored === stats.enrichAttempted) {
+    return `, ${c.green}✎${stats.enrichStored}/${stats.enrichAttempted}${c.reset} notes`;
+  }
+  const empty = stats.enrichAttempted - stats.enrichStored;
+  return `, ${c.red}✎${stats.enrichStored}/${stats.enrichAttempted} notes — ${empty} produced nothing (LLM endpoint problem? run 'clawmem doctor')${c.reset}`;
 }
 
 // =============================================================================
@@ -258,7 +279,7 @@ async function cmdUpdate(args: string[]) {
 
     console.log(`${c.cyan}Indexing ${col.name}${c.reset} (${col.path})`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern);
-    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed`);
+    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed${enrichSummaryNote(stats)}`);
   }
 
   // Auto-embed if --embed flag is set
@@ -464,7 +485,7 @@ async function cmdMine(args: string[]) {
     console.log(`\n${c.cyan}Indexing ${totalChunks} conversation chunks${c.reset} as collection '${collectionName}'`);
     const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md", { importMode: true });
     const datedNote = stats.dated > 0 ? `, ${c.cyan}◷${stats.dated}${c.reset} dated` : "";
-    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged${datedNote}`);
+    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged${datedNote}${enrichSummaryNote(stats)}`);
 
     // Ext 4 — post-import conversation synthesis (opt-in via --synthesize)
     // Runs AFTER indexCollection has committed. Failure is non-fatal and never
@@ -2438,7 +2459,7 @@ async function cmdWatch() {
       // Re-index just this collection
       const stats = await indexCollection(s, col.name, col.path, col.pattern);
       if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
-        console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}`);
+        console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}${enrichSummaryNote(stats)}`);
       }
     },
     onError: (err) => {
@@ -2513,7 +2534,7 @@ async function cmdReindex(args: string[]) {
   for (const col of collections) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force });
-    console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
+    console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed${enrichSummaryNote(stats)}`);
   }
 }
 
@@ -2792,6 +2813,57 @@ async function cmdDoctor() {
       process.exitCode = 1;
     } else {
       console.log(`${c.yellow}!${c.reset} Sampled vectors: could not run (${(err as Error).message})`);
+    }
+  }
+
+  // 12. Remote LLM endpoint shape (issue #24). Reachability is not the same as
+  // serving chat completions: a port squatted by an unrelated service answers
+  // HTTP (404/501/…) forever, which through v0.36.0 never engaged the local
+  // fallback — enrichment failed silently on every call. The reranker (section
+  // 9) and the embedding server (geometry canary) already have active shape
+  // probes; this closes the same "liveness ≠ correctness" gap for the third
+  // inference service. POST a minimal completion and validate the OpenAI
+  // response shape.
+  {
+    const llmUrl = process.env.CLAWMEM_LLM_URL;
+    // The consequence of a broken endpoint depends on the fallback POLICY
+    // (codex turn-2 finding 4): under CLAWMEM_NO_LOCAL_MODELS=true there is no
+    // fallback by design — saying "the fallback path will be used" there is
+    // exactly the false comfort this section exists to remove.
+    const noLocal = process.env.CLAWMEM_NO_LOCAL_MODELS === "true";
+    const consequence = noLocal
+      ? "Fallback is disabled by policy (CLAWMEM_NO_LOCAL_MODELS=true), so enrichment and query expansion will produce nothing until this is fixed"
+      : "Enrichment and query expansion will run on the in-process fallback path";
+    if (!llmUrl) {
+      console.log(
+        noLocal
+          ? `${c.yellow}!${c.reset} LLM endpoint: CLAWMEM_LLM_URL not set AND CLAWMEM_NO_LOCAL_MODELS=true — generation is fully disabled (no remote, no fallback)`
+          : `${c.yellow}!${c.reset} LLM endpoint: CLAWMEM_LLM_URL not set (in-process fallback model will be used)`
+      );
+    } else {
+      const ep = buildRemoteChatCompletionsUrl(llmUrl);
+      // Same request the runtime would make: model name and the no-think
+      // policy come from the SAME env normalization getDefaultLlamaCpp uses —
+      // an endpoint configured with CLAWMEM_LLM_NO_THINK=false must not be
+      // probed with a control token it may reject (codex turn-1 finding 3).
+      const probe = await LlamaCpp.probeChatCompletionsShape({
+        url: llmUrl,
+        apiKey: process.env.CLAWMEM_LLM_API_KEY || undefined,
+        model: process.env.CLAWMEM_LLM_MODEL,
+        noThink: normalizeRemoteLlmNoThink(process.env.CLAWMEM_LLM_NO_THINK) ?? true,
+      });
+      if (probe.status === "ok") {
+        console.log(`${c.green}✓${c.reset} LLM endpoint: ${ep} serves chat completions (model ${probe.model})`);
+      } else if (probe.status === "http") {
+        console.log(`${c.red}✗${c.reset} LLM endpoint: ${ep} answered HTTP ${probe.httpStatus} — reachable but NOT serving chat completions (another service on the port, or a misconfigured model name). ${consequence}. Check CLAWMEM_LLM_URL / CLAWMEM_LLM_MODEL.`);
+        issues++;
+      } else if (probe.status === "shape") {
+        console.log(`${c.red}✗${c.reset} LLM endpoint: ${ep} answered 200 but the body is not a chat-completions response (${probe.detail}) — wrong service on the port?`);
+        issues++;
+      } else {
+        console.log(`${c.red}✗${c.reset} LLM endpoint: could not reach ${ep} (${probe.detail}). ${noLocal ? "Fallback is disabled by policy (CLAWMEM_NO_LOCAL_MODELS=true), so generation will produce nothing until the endpoint is reachable" : "Transport cooldown + in-process fallback will be used at runtime"}`);
+        issues++;
+      }
     }
   }
 

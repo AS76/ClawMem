@@ -297,7 +297,9 @@ Quick index health check.
 
 ### reindex
 
-Trigger re-scan of all collections.
+Trigger re-scan of all collections. The summary (and `structuredContent`) carries
+`enrichAttempted`/`enrichStored` note counters — a run whose every enrichment produced
+nothing reports the gap explicitly instead of an unqualified success (v0.37.0).
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -381,7 +383,7 @@ Index markdown from a directory into a named vault.
 | `pattern` | string | `**/*.md` | Glob pattern |
 | `collection_name` | string | vault name | Collection name in the vault |
 
-Restricted-path validation rejects sensitive directories (`/etc/`, `/root/`, `.ssh`, `.env`, `credentials`, `.aws`, `.kube`).
+Restricted-path validation rejects sensitive directories (`/etc/`, `/root/`, `.ssh`, `.env`, `credentials`, `.aws`, `.kube`). The summary carries a `Notes: stored/attempted` line with an explicit warning when enrichment produced nothing (v0.37.0).
 
 ### kg_query
 

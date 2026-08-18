@@ -534,3 +534,127 @@ describe("D8.2: enrichment failure must not write an empty note", () => {
     expect(logged.some(l => /Enriched doc/.test(l))).toBe(false); // and not reported as enriched
   }, 60_000);
 });
+
+// ---------------------------------------------------------------------------
+// Issue #24 (codex turn-2 findings 1–3) — note counters: outcome semantics,
+// accumulation, and the public surfaces that present an index run
+// ---------------------------------------------------------------------------
+
+describe("issue-24 note counters", () => {
+  /** Produces a valid, storable memory note; embedding stays dead so the later
+   *  phases (entities, links) produce nothing — which must NOT change the
+   *  note-write metric. */
+  const okLlm = {
+    embed: async () => { throw new Error("no embedding endpoint in test"); },
+    generate: async () => ({ text: '{"keywords":["kw1"],"tags":["t1"],"context":"ctx"}', model: "test-ok", done: true }),
+    expandQuery: async () => [],
+  } as any;
+
+  afterEach(() => {
+    delete process.env.CLAWMEM_ENABLE_AMEM;
+    delete process.env.CLAWMEM_CONFIG_DIR;
+    delete process.env.CLAWMEM_VAULTS;
+  });
+
+  it("postIndexEnrich outcome taxonomy: disabled / empty / stored", async () => {
+    writeDoc("m.md", "# M\n\nbody\n");
+    await reindex();
+    const id = rowOf("m.md")!.id;
+
+    process.env.CLAWMEM_ENABLE_AMEM = "false";
+    expect(await store.postIndexEnrich(deadLlm, id, false)).toBe("disabled");
+    delete process.env.CLAWMEM_ENABLE_AMEM;
+
+    // The LLM produces nothing usable → the note write is refused → "empty".
+    expect(await store.postIndexEnrich(deadLlm, id, false)).toBe("empty");
+
+    // A stored note reports "stored" even though the later phases (entities,
+    // links) produce nothing with this stub — the metric is the note write,
+    // not whole-pipeline success (codex turn-2 finding 1).
+    expect(await store.postIndexEnrich(okLlm, id, true)).toBe("stored");
+    const kw = (store.db.prepare("SELECT amem_keywords FROM documents WHERE id = ?").get(id) as { amem_keywords: string | null }).amem_keywords;
+    expect(kw ?? "").toContain("kw1");
+  }, 60_000);
+
+  it("indexCollection accumulates enrichAttempted/enrichStored, keyed on the note write", async () => {
+    writeDoc("a.md", "# A\n\nalpha\n");
+    writeDoc("b.md", "# B\n\nbeta\n");
+    const dead = await reindex();                 // deadLlm from beforeEach
+    expect(dead.enrichAttempted).toBe(2);
+    expect(dead.enrichStored).toBe(0);            // removing the accumulation reds this
+
+    setDefaultLlamaCpp(okLlm);
+    writeDoc("c.md", "# C\n\ngamma\n");
+    const ok = await reindex();                   // only the NEW doc enqueues enrichment
+    expect(ok.enrichAttempted).toBe(1);
+    expect(ok.enrichStored).toBe(1);
+  }, 60_000);
+
+  it("CLAWMEM_ENABLE_AMEM=false is excluded from the counters entirely", async () => {
+    process.env.CLAWMEM_ENABLE_AMEM = "false";
+    writeDoc("d.md", "# D\n\ndelta\n");
+    const stats = await reindex();
+    expect(stats.enrichAttempted).toBe(0);
+    expect(stats.enrichStored).toBe(0);
+  }, 60_000);
+
+  it("REST /reindex carries the note counters", async () => {
+    const CONF = `${ROOT}/config`;
+    mkdirSync(CONF, { recursive: true });
+    writeFileSync(`${CONF}/config.yaml`, `collections:\n  docs:\n    path: ${CONTENT}\n    pattern: "**/*.md"\n`);
+    process.env.CLAWMEM_CONFIG_DIR = CONF;
+
+    writeDoc("rest-counters.md", "# R\n\nrho\n");
+    const server = startServer(store, 7439 + ((process.pid + 17) % 200), "127.0.0.1");
+    try {
+      const resp = await fetch(`http://127.0.0.1:${server.port}/reindex`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ collection: "docs" }),
+      });
+      expect(resp.status).toBe(200);
+      const body = await resp.json() as Record<string, number>;
+      expect(body.enrichAttempted).toBe(1);       // the one new doc
+      expect(body.enrichStored).toBe(0);          // dead LLM → note produced nothing
+    } finally {
+      server.stop(true);
+    }
+  }, 60_000);
+
+  it("MCP reindex and vault_sync summaries carry the note counters", async () => {
+    const CONF = `${ROOT}/config`;
+    mkdirSync(CONF, { recursive: true });
+    writeFileSync(`${CONF}/config.yaml`, `collections:\n  docs:\n    path: ${CONTENT}\n    pattern: "**/*.md"\n`);
+    process.env.CLAWMEM_CONFIG_DIR = CONF;
+    process.env.CLAWMEM_VAULTS = JSON.stringify({ testv: `${ROOT}/vault-testv.sqlite` });
+
+    writeDoc("mcp-counters.md", "# P\n\npi\n");
+
+    const prevIndexPath = process.env.INDEX_PATH;
+    process.env.INDEX_PATH = DB;
+    const built = buildMcpServer();
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await built.server.connect(serverTransport);
+    const client = new Client({ name: "issue24-counters", version: "0.0.0" });
+    await client.connect(clientTransport);
+    try {
+      const re = await client.callTool({ name: "reindex", arguments: {} }) as { content?: { text?: string }[]; structuredContent?: Record<string, unknown> };
+      const text = re.content?.[0]?.text ?? "";
+      expect(text).toContain("notes");
+      expect(text).toContain("produced nothing");
+      expect(re.structuredContent?.enrichAttempted).toBe(1);
+      expect(re.structuredContent?.enrichStored).toBe(0);
+
+      const vs = await client.callTool({ name: "vault_sync", arguments: { vault: "testv", content_root: CONTENT } }) as { content?: { text?: string }[]; structuredContent?: Record<string, unknown> };
+      const vsText = vs.content?.[0]?.text ?? "";
+      expect(vsText).toContain("Notes:");
+      expect(vsText).toContain("produced nothing");
+      expect((vs.structuredContent?.enrichAttempted as number) ?? 0).toBeGreaterThanOrEqual(1);
+      expect(vs.structuredContent?.enrichStored).toBe(0);
+    } finally {
+      await client.close();
+      built.closeAllStores();
+      if (prevIndexPath === undefined) delete process.env.INDEX_PATH; else process.env.INDEX_PATH = prevIndexPath;
+    }
+  }, 120_000);
+});

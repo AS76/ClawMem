@@ -536,4 +536,254 @@ describe("LLM Remote Fallback", () => {
       expect(embedLocalSpy).not.toHaveBeenCalled();
     }, 10000);
   });
+
+  // ─── HTTP-shape down-cache (issue #24 — squatted port) ─────────────
+  //
+  // A port occupied by an unrelated service answers HTTP errors FOREVER while
+  // being "reachable". Through v0.36.0 that state never tripped the down-cache,
+  // so the local fallback never engaged and enrichment failed silently on every
+  // call. The single-HTTP-error tests above still hold (one 400/500 must NOT
+  // cost the GPU lane); these cover the streak and endpoint-shape triggers.
+
+  describe("HTTP-shape down-cache (issue #24)", () => {
+    it("HTTP 501 trips the LLM cooldown immediately (endpoint-shape status) with one actionable line", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      globalThis.fetch = (() =>
+        Promise.resolve(new Response("Unsupported method", { status: 501, statusText: "Not Implemented" }))
+      ) as any;
+
+      const result = await llm.generate("test");
+      expect(result).toBeNull();
+
+      // Cooldown active: the next call must not reach the network.
+      let fetchCalled = false;
+      globalThis.fetch = (() => { fetchCalled = true; return new Response("ok"); }) as any;
+      await llm.generate("second");
+      expect(fetchCalled).toBe(false);
+
+      // Exactly one loud line, naming the URL and the env var to fix.
+      const tripLines = errSpy.mock.calls
+        .map(call => String(call[0]))
+        .filter(s => s.includes("answers HTTP but not the chat-completions API"));
+      expect(tripLines.length).toBe(1);
+      expect(tripLines[0]).toContain("http://localhost:8089");
+      expect(tripLines[0]).toContain("CLAWMEM_LLM_URL");
+      errSpy.mockRestore();
+    });
+
+    it("HTTP 404 is streak-based, NOT instant (cloud gateways 404 on unknown models)", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      let fetches = 0;
+      globalThis.fetch = (() => {
+        fetches++;
+        return Promise.resolve(new Response("Unknown model", { status: 404 }));
+      }) as any;
+
+      // A single 404 (e.g. a mis-set CLAWMEM_LLM_MODEL on a healthy gateway)
+      // must not instantly cost the lane — codex turn-1 finding 1.
+      await llm.generate("a"); // streak 1
+      await llm.generate("b"); // streak 2
+      expect(fetches).toBe(2); // both reached the network
+      await llm.generate("c"); // streak 3 → trip
+      expect(fetches).toBe(3);
+      await llm.generate("d"); // cooldown — skipped
+      expect(fetches).toBe(3);
+      errSpy.mockRestore();
+    });
+
+    it("concurrent in-flight HTTP failures produce exactly ONE trip line (idempotent transition)", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      // All three requests pass the pre-fetch cooldown check together, then all
+      // three come back 501. Only the first response may own the transition —
+      // codex turn-1 finding 2 reproduced three actionable lines here.
+      globalThis.fetch = (() =>
+        new Promise<Response>(resolve =>
+          setTimeout(() => resolve(new Response("nope", { status: 501 })), 20)
+        )
+      ) as any;
+
+      await Promise.all([llm.generate("a"), llm.generate("b"), llm.generate("c")]);
+
+      const tripLines = errSpy.mock.calls
+        .map(call => String(call[0]))
+        .filter(s => s.includes("answers HTTP but not the chat-completions API"));
+      expect(tripLines.length).toBe(1);
+      errSpy.mockRestore();
+    });
+
+    it("two consecutive HTTP 500s do NOT trip the cooldown; the third does", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      let fetches = 0;
+      globalThis.fetch = (() => {
+        fetches++;
+        return Promise.resolve(new Response("Internal Server Error", { status: 500 }));
+      }) as any;
+
+      await llm.generate("a"); // streak 1
+      await llm.generate("b"); // streak 2
+      expect(fetches).toBe(2); // both reached the network — a flaky-but-real server keeps its lane
+      await llm.generate("c"); // streak 3 → trip
+      expect(fetches).toBe(3);
+      await llm.generate("d"); // cooldown — remote skipped
+      expect(fetches).toBe(3);
+      errSpy.mockRestore();
+    });
+
+    it("a success resets the streak", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      const responses: Array<() => Response> = [
+        () => new Response("ISE", { status: 500 }),
+        () => new Response("ISE", { status: 500 }),
+        () => new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 }),
+        () => new Response("ISE", { status: 500 }),
+        () => new Response("ISE", { status: 500 }),
+      ];
+      let fetches = 0;
+      globalThis.fetch = (() => { fetches++; return Promise.resolve(responses.shift()!()); }) as any;
+
+      await llm.generate("1"); // streak 1
+      await llm.generate("2"); // streak 2
+      const ok = await llm.generate("3"); // success → streak resets to 0
+      expect(ok?.text).toBe("ok");
+      await llm.generate("4"); // streak 1
+      await llm.generate("5"); // streak 2 — still below the trip
+      expect(fetches).toBe(5); // every call reached the network
+      errSpy.mockRestore();
+    });
+
+    it("HTTP 429 never counts toward the streak (rate limiting is a healthy endpoint)", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      let fetches = 0;
+      globalThis.fetch = (() => {
+        fetches++;
+        return Promise.resolve(new Response("rate limited", { status: 429 }));
+      }) as any;
+
+      for (let i = 0; i < 5; i++) await llm.generate(`q${i}`);
+      expect(fetches).toBe(5); // no cooldown ever
+      errSpy.mockRestore();
+    });
+
+    it("the trip routes generate() onto the local-fallback path in the SAME call (the issue-#24 fix)", async () => {
+      const llm = createLlm();
+      // Deliberately NO CLAWMEM_NO_LOCAL_MODELS — local fallback is the designed degradation.
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+      const ensureGenerateModel = spyOn(llm as any, "ensureGenerateModel").mockImplementation(() => {
+        throw new Error("LOCAL-PATH-ENTERED");
+      });
+
+      globalThis.fetch = (() =>
+        Promise.resolve(new Response("Not Implemented", { status: 501 }))
+      ) as any;
+
+      // Bug-first: before the fix this returned null with NO cooldown and NO
+      // fallback — enrichment silently dead on every call, forever. Now the
+      // endpoint-shape 501 trips instantly and the same call falls through to
+      // the local path (the sentinel throw proves entry).
+      await expect(llm.generate("test")).rejects.toThrow("LOCAL-PATH-ENTERED");
+      expect(ensureGenerateModel).toHaveBeenCalled();
+      ensureGenerateModel.mockRestore();
+      errSpy.mockRestore();
+    });
+
+    it("generateJudgeChat HTTP errors stay typed and do NOT trip the shared down-cache", async () => {
+      const llm = createLlm();
+      // 501 is instant-trip class on the generate lane — if the judge lane fed
+      // the shared accounting at all, this single response would trip it.
+      globalThis.fetch = (() =>
+        Promise.resolve(new Response("Not Implemented", { status: 501, statusText: "Not Implemented" }))
+      ) as any;
+
+      const r = await llm.generateJudgeChat({ system: "s", user: "u", maxTokens: 10 });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe("http");
+
+      // The judge lane reports typed failures to ITS caller; it must not flip
+      // this instance's generate() lane into cooldown.
+      let fetchCalled = false;
+      globalThis.fetch = (() => {
+        fetchCalled = true;
+        return Promise.resolve(new Response(JSON.stringify({
+          choices: [{ message: { content: "ok" } }],
+        }), { status: 200 }));
+      }) as any;
+      const g = await llm.generate("after");
+      expect(fetchCalled).toBe(true);
+      expect(g?.text).toBe("ok");
+    });
+
+    it("embed: HTTP 501 trips the self-hosted embed cooldown", async () => {
+      const llm = createLlm();
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      globalThis.fetch = (() =>
+        Promise.resolve(new Response("Not Implemented", { status: 501 }))
+      ) as any;
+      // Deadline signal → the local fallback is skipped in-test (B4 path).
+      await llm.embed("text", { signal: AbortSignal.timeout(5000) });
+
+      // Cooldown active — the second call must skip the network entirely.
+      let fetchCalled = false;
+      globalThis.fetch = (() => { fetchCalled = true; return new Response("ok"); }) as any;
+      const r2 = await llm.embed("text2", { signal: AbortSignal.timeout(5000) });
+      expect(fetchCalled).toBe(false);
+      expect(r2).toBeNull();
+      errSpy.mockRestore();
+    });
+
+    it("embed: the cloud lane (API key set) never trips on HTTP errors", async () => {
+      const llm = createLlm({ remoteEmbedApiKey: "sk-cloud", remoteEmbedUrl: "https://api.openai.com" });
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      let fetches = 0;
+      globalThis.fetch = (() => {
+        fetches++;
+        return Promise.resolve(new Response("Unauthorized", { status: 401 }));
+      }) as any;
+
+      await llm.embed("a");
+      await llm.embed("b");
+      // Both calls reached the network: an auth/quota error on a chosen cloud
+      // provider stays a per-call error and never flips the vault toward a
+      // different local model.
+      expect(fetches).toBe(2);
+      errSpy.mockRestore();
+    });
+
+    it("embedBatch: 501 trips the self-hosted cooldown too", async () => {
+      const llm = createLlm();
+      process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+
+      globalThis.fetch = (() =>
+        Promise.resolve(new Response("Not Implemented", { status: 501 }))
+      ) as any;
+      await llm.embedBatch(["a"]); // instant trip
+
+      let fetchCalled = false;
+      globalThis.fetch = (() => { fetchCalled = true; return new Response("ok"); }) as any;
+      const r = await llm.embedBatch(["b"]);
+      expect(fetchCalled).toBe(false);
+      expect(r).toEqual([null]);
+      errSpy.mockRestore();
+    });
+  });
 });

@@ -4,6 +4,106 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.37.0 — a reachable-but-wrong inference endpoint now degrades instead of silently dying
+
+Issue #24: when `CLAWMEM_LLM_URL` pointed at a port where an *unrelated* service answered
+HTTP (a file browser squatting `:8089`), every `generate()` call failed **silently and
+permanently**. HTTP errors deliberately never tripped the transport down-cache ("the
+server IS reachable"), so the local in-process fallback never engaged — A-MEM enrichment
+produced nothing for months while indexing kept reporting success. A *dead* port degraded
+gracefully; a *squatted* one failed forever.
+
+### HTTP-shape down-cache
+
+The single-error rule is unchanged — one 400/500 from a real server having a bad moment
+never costs it the GPU lane, and 429 (a healthy-but-limited endpoint) is never counted.
+What changed is the pathological tail:
+
+- **405 / 501 trip the 60s cooldown immediately** — a correctly-routed
+  OpenAI-compatible route cannot return these; they are the signature of another service
+  listening on the port. **404 is deliberately streak-based, not instant**: cloud and
+  gateway endpoints return 404 for an unknown model or deployment while the route itself
+  is fine, so a mis-set `CLAWMEM_LLM_MODEL` must not instantly cost the lane. A genuinely
+  squatted port 404s every call and still trips within three.
+- **Any other non-2xx trips after 3 consecutive failures.** A success resets the streak.
+- The trip emits **one loud, actionable line** naming the URL, the observed status, and
+  the env var to fix — then the existing cooldown + fallback + notify-once machinery
+  takes over. The transition is idempotent under concurrency: in-flight requests that
+  return errors after the lane is already down are swallowed, so the line really is one
+  line. The cooldown self-heals: a recovered server gets its lane back on the first
+  attempt after expiry.
+- With local fallback **permitted** (the default), enrichment and query expansion degrade
+  to the in-process model during the cooldown instead of dying. Under
+  `CLAWMEM_NO_LOCAL_MODELS=true` there is still no fallback by policy — those
+  deployments keep getting nulls, now with the trip line and the run-summary counter
+  below instead of silence.
+- The same trip protects the **self-hosted embedding lane** (`CLAWMEM_EMBED_URL`, single
+  and batch). **Cloud embedding (API key set) is deliberately exempt**: those lanes never
+  fall back by design, and an auth/quota HTTP error must stay a per-call error rather
+  than flip the vault onto a different local model mid-run.
+- The **judge lane is untouched**: `generateJudgeChat` keeps returning typed `http`
+  failures to its caller and never trips the shared cache (judge-scoped instances are
+  separate objects anyway). The reranker needs no HTTP trip — it already has shape-level
+  protection (discrimination probe + degenerate-score fallback to RRF).
+- Known limit, stated: a squatter answering **200 with a non-JSON body** is not counted —
+  the parse failure still surfaces as a logged per-call error. Non-2xx is the observed
+  squatted-port signature and the conservative trigger.
+
+### Index-run summaries count note productivity
+
+`clawmem update`, `reindex`, `mine`, the watcher, the MCP `reindex` and `vault_sync`
+tools, and the REST `/reindex` response now report `✎stored/attempted notes` whenever
+A-MEM enrichment ran, and call out a gap explicitly (`N produced nothing (LLM endpoint
+problem? run 'clawmem doctor')`). This is the reporter's third suggestion: a run whose
+every enrichment produced nothing must not end in an unqualified success summary, and
+per-doc `[amem]` lines are too easy to read past. The metric is deliberately the NOTE
+WRITE — the one phase every enrichment attempt runs — not whole-pipeline success: a
+stored note whose later link phase failed still counts as stored (the failure keeps its
+own log line), and an empty note whose entity phase happened to succeed still counts as
+producing nothing.
+
+### `clawmem doctor` probes the LLM endpoint's shape
+
+Reachability is not the same as serving chat completions. Doctor now POSTs a minimal
+completion to `CLAWMEM_LLM_URL` and validates the response deeply (a non-empty `choices`
+array whose first message content is a string — `{"choices":[]}` proves nothing),
+honoring the same `CLAWMEM_LLM_MODEL` / `CLAWMEM_LLM_NO_THINK` normalization the runtime
+uses. This closes the same "liveness ≠ correctness" gap the reranker discrimination probe
+and the embedding geometry canary already close for the other two inference services. A
+squatted port shows as `✗ LLM endpoint: … reachable but NOT serving chat completions`; an
+unset URL is a yellow note (the in-process fallback is a supported configuration).
+
+No schema change, no migration, no new configuration. Behavior change: deployments whose
+LLM endpoint persistently answers HTTP errors will now see the local fallback engage in
+60s windows (with one explanatory line per trip) where they previously saw permanent
+silent nulls — where local fallback is permitted; under `CLAWMEM_NO_LOCAL_MODELS=true`
+the outcome stays null by policy and the trip line plus the note counters are the
+improvement. `IndexStats` gains `enrichAttempted`/`enrichStored` (additive), and the
+REST `/reindex` response carries the same two fields.
+
+### Verification
+
+Cross-model adversarial pass (codex / GPT-5.x), one pinned session: four turns to zero
+remaining findings (5→4→1→0). Review-driven hardening along the way: 404 demoted from
+instant-trip to streak-based (cloud gateways legitimately 404 on an unknown model), the
+trip transition made idempotent under concurrent in-flight requests, the doctor probe
+extracted into a directly-testable function honoring the runtime's no-think/model
+normalization, and the counters re-keyed to the note write with the remaining public
+surfaces (REST `/reindex`, MCP `vault_sync`) brought into line. Production-boundary
+tests drive real fixture HTTP servers through the probe taxonomy, the real
+`clawmem doctor` CLI as a subprocess, and the real REST and MCP handlers for the
+counters. Full suite at clearance: 2231 tests, 0 failures.
+
+### What didn't change
+
+A *single* HTTP error still never costs the lane — the streak resets on success, 429
+never counts, and AbortError/transport classification are untouched. Cloud embedding
+keeps its no-fallback contract. The judge lane keeps returning typed `http` failures and
+never touches the shared down-cache. The reranker keeps its existing shape-level
+protection (discrimination probe + degenerate-score RRF fallback). The stdio MCP
+transport is untouched. No new environment variables; the trip thresholds are design
+constants.
+
 ## v0.36.0 — the ranking pipeline and vault lifecycle become inspectable
 
 Two read-only diagnostic MCP tools. Composite ranking and lifecycle state were

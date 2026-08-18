@@ -526,19 +526,27 @@ async function handleReindex(req: Request, _url: URL, store: Store): Promise<Res
   }
 
   let totalAdded = 0, totalUpdated = 0, totalRemoved = 0;
+  let enrichAttempted = 0, enrichStored = 0;
 
   for (const coll of targetCollections) {
     const stats = await indexCollection(store, coll.name, coll.path, coll.pattern);
     totalAdded += stats.added;
     totalUpdated += stats.updated;
     totalRemoved += stats.removed;
+    enrichAttempted += stats.enrichAttempted;
+    enrichStored += stats.enrichStored;
   }
 
+  // Issue #24 (codex turn-2 finding 3): the REST surface must carry the note
+  // counters too — a reindex whose every enrichment produced nothing is not an
+  // unqualified success, whichever surface invoked it.
   return jsonResponse({
     collections: targetCollections.length,
     added: totalAdded,
     updated: totalUpdated,
     removed: totalRemoved,
+    enrichAttempted,
+    enrichStored,
   });
 }
 

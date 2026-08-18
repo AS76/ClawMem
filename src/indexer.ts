@@ -65,6 +65,16 @@ export interface IndexStats {
   removed: number;
   /** §51.1: dated-only metadata transitions (authored_at set without touching modified_at / A-MEM) */
   dated: number;
+  /**
+   * A-MEM enrichment outcomes for this run (issue #24, codex turn-1 finding 5):
+   * attempted = enrichments that ran (excludes CLAWMEM_ENABLE_AMEM=false);
+   * stored = the note step produced and stored content. attempted − stored is
+   * the "LLM produced nothing" count — a persistently nonzero gap is the
+   * squatted-port / dead-inference signature that per-doc log lines let hide
+   * inside an otherwise-successful update summary.
+   */
+  enrichAttempted: number;
+  enrichStored: number;
 }
 
 // =============================================================================
@@ -228,7 +238,7 @@ export async function indexCollection(
       `it cannot be reconciled against a root.`,
     );
   }
-  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
+  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0, enrichAttempted: 0, enrichStored: 0 };
   const activePaths = new Set<string>();
 
   // importMode: an additive DB-born ingest routed through the filesystem pipeline via a
@@ -502,7 +512,9 @@ export async function indexCollection(
   // A-MEM enrichment runs after successful commit (LLM calls should not block transaction)
   // forceEnrich overrides isNew to true — triggers full pipeline (entity extraction, links, evolution)
   for (const { docId, isNew } of enrichQueue) {
-    await store.postIndexEnrich(llm, docId, options?.forceEnrich ? true : isNew);
+    const outcome = await store.postIndexEnrich(llm, docId, options?.forceEnrich ? true : isNew);
+    if (outcome !== "disabled") stats.enrichAttempted++;
+    if (outcome === "stored") stats.enrichStored++;
   }
 
   return stats;

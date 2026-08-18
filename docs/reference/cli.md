@@ -7,7 +7,7 @@ Complete command reference for the ClawMem memory engine. Always use the `bin/cl
 ```bash
 clawmem init                    # Initialize vault (creates SQLite DB)
 clawmem status                  # Quick index status
-clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set)
+clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, LLM endpoint shape probe — a squatted port that answers HTTP but not chat completions shows red, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set)
 ```
 
 ## Collection management
@@ -21,7 +21,7 @@ clawmem collection remove <name>               # Remove a collection
 ## Indexing
 
 ```bash
-clawmem update                  # Index all collections (BM25 only)
+clawmem update                  # Index all collections (BM25 only); summary reports ✎stored/attempted notes when A-MEM enrichment ran
 clawmem update --embed          # Index + embed in one pass
 clawmem mine <dir>                             # Import conversation exports (Claude, ChatGPT, Slack)
 clawmem mine <dir> -c convos                   # Import with custom collection name
